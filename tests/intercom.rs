@@ -91,6 +91,21 @@ impl Fixture {
     fn descriptor(&self, id: &str) -> Value {
         serde_json::from_slice(&fs::read(self.root().join(id).join("peer.json")).unwrap()).unwrap()
     }
+
+    fn own_peer(&self, id: &str, port: u16) -> File {
+        if !self.root().exists() {
+            private_dir(&self.root());
+        }
+        let dir = self.root().join(id);
+        private_dir(&dir);
+        let lock = private_file(&dir.join("owner.lock"));
+        lock.lock().unwrap();
+        let descriptor = json!({"protocol":1,"peer":{"id":id,"name":"fixture"},"port":port,"token":"a".repeat(64)});
+        private_file(&dir.join("peer.json"))
+            .write_all(descriptor.to_string().as_bytes())
+            .unwrap();
+        lock
+    }
 }
 
 impl Drop for Fixture {
@@ -113,13 +128,13 @@ impl Drop for PeerProcess {
 }
 
 fn private_dir(path: &Path) {
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
     }
-    builder.create(path).unwrap();
+    #[cfg(not(unix))]
+    fs::create_dir(path).unwrap();
 }
 
 fn private_file(path: &Path) -> File {
@@ -419,4 +434,65 @@ fn slow_partial_frames_expire_and_release_connection_slots() {
         peer.events.recv_timeout(Duration::from_secs(2)).unwrap()["message"]["text"],
         "After deadline"
     );
+}
+
+#[test]
+fn full_ids_isolate_delivery_from_unrelated_invalid_registrations() {
+    let fixture = Fixture::new();
+    let a = fixture.listen("api");
+    let b = fixture.listen("review");
+    let invalid = "f".repeat(32);
+    let _owner = fixture.own_peer(&invalid, 9);
+    fs::write(fixture.root().join(&invalid).join("peer.json"), "{").unwrap();
+    fixture.json(&["send", &b.id.to_ascii_uppercase(), "Ready", "--from", &a.id]);
+    assert_eq!(
+        b.events.recv_timeout(Duration::from_secs(2)).unwrap()["message"]["text"],
+        "Ready"
+    );
+}
+
+#[test]
+fn ambiguous_prefixes_fail_before_contacting_a_receiver() {
+    let fixture = Fixture::new();
+    let _a = fixture.own_peer(&format!("abcdef{}", "0".repeat(26)), 9);
+    let _b = fixture.own_peer(&format!("abcdef{}", "1".repeat(26)), 9);
+    let output = fixture.run(&["--json", "send", "abcdef", "Ready"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"]["code"],
+        "ambiguous_peer"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_defaults_ignore_empty_paths_and_reject_relative_paths() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command();
+    command
+        .env_remove("INTERCOM_DIR")
+        .env("HOME", &fixture.0)
+        .env("XDG_RUNTIME_DIR", "")
+        .args(["--json", "list"]);
+    let mut child = command.spawn().unwrap();
+    wait(&mut child, Duration::from_secs(5));
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert!(fixture.0.join(".cache/agent-intercom").is_dir());
+
+    let mut command = fixture.command();
+    command
+        .env_remove("INTERCOM_DIR")
+        .env("HOME", &fixture.0)
+        .env("XDG_RUNTIME_DIR", "relative")
+        .current_dir(&fixture.0)
+        .args(["--json", "list"]);
+    let mut child = command.spawn().unwrap();
+    wait(&mut child, Duration::from_secs(5));
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"]["code"],
+        "runtime"
+    );
+    assert!(!fixture.0.join("relative").exists());
 }

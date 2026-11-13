@@ -37,7 +37,9 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         let code = match error.kind() {
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "timeout",
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                return Self::new("timeout", "Request timed out");
+            }
             std::io::ErrorKind::NotFound => "not_found",
             _ => "io",
         };
@@ -150,7 +152,10 @@ pub fn write_frame(
     let mut offset = 0;
     while offset < frame.len() {
         stream.set_write_timeout(Some(remaining(deadline)?))?;
-        let count = stream.write(&frame[offset..])?;
+        let count = match stream.write(&frame[offset..]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if count == 0 {
             return Err(Error::new("closed", "Peer closed the connection"));
         }
@@ -164,7 +169,10 @@ pub fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream, deadline: Instant
         let mut offset = 0;
         while offset < data.len() {
             stream.set_read_timeout(Some(remaining(deadline)?))?;
-            let count = stream.read(&mut data[offset..])?;
+            let count = match stream.read(&mut data[offset..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
             if count == 0 {
                 return Err(Error::new("closed", "Peer closed the connection"));
             }

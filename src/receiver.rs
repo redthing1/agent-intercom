@@ -46,9 +46,12 @@ pub fn listen(root: &Path, name: String) -> Result<()> {
     thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut input = std::io::stdin().lock();
-        while let Ok(count) = input.read(&mut buffer) {
-            if count == 0 {
-                break;
+        loop {
+            match input.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
         }
         stop.store(true, Ordering::Release);
@@ -102,6 +105,7 @@ pub fn listen(root: &Path, name: String) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10))
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.into()),
         }
     }

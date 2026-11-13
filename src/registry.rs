@@ -35,14 +35,18 @@ fn remove_registration(dir: &Path, lock: Option<File>) {
     let _ = fs::remove_dir(dir);
 }
 
-fn private_dir(path: &Path) -> Result<()> {
-    let mut builder = fs::DirBuilder::new();
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        fs::DirBuilder::new().mode(0o700).create(path)
     }
-    match builder.create(path) {
+    #[cfg(not(unix))]
+    fs::create_dir(path)
+}
+
+fn private_dir(path: &Path) -> Result<()> {
+    match create_private_dir(path) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
         Err(e) => return Err(e.into()),
@@ -92,6 +96,7 @@ pub fn root() -> Result<PathBuf> {
         let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
         #[cfg(not(windows))]
         let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|path| !path.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")));
         let base = base.ok_or_else(|| {
@@ -100,6 +105,9 @@ pub fn root() -> Result<PathBuf> {
                 "Set INTERCOM_DIR to a private absolute directory",
             )
         })?;
+        if !base.is_absolute() {
+            return Err(Error::new("runtime", "Runtime directory must be absolute"));
+        }
         fs::create_dir_all(&base)?;
         base.join("agent-intercom")
     };
@@ -116,13 +124,7 @@ pub fn register(root: &Path, name: String, port: u16) -> Result<Registration> {
     let token = random_hex(32)?;
     let dir = root.join(&id);
     // Fresh IDs are never reused, including during concurrent stale cleanup.
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(&dir)?;
+    create_private_dir(&dir)?;
     let mut registration = Registration {
         dir,
         lock: None,
@@ -216,15 +218,25 @@ pub fn resolve(root: &Path, target: &str, deadline: Instant) -> Result<Descripto
             "Use a peer ID or an unambiguous prefix of at least 6 characters",
         ));
     }
-    let mut matches = list(root, deadline)?
-        .into_iter()
-        .filter(|d| d.peer.id.starts_with(target));
-    let peer = matches
-        .next()
-        .ok_or_else(|| Error::new("not_found", "Peer is no longer registered"))?;
-    if matches.next().is_some() {
-        return Err(Error::new("ambiguous_peer", "Peer ID prefix is ambiguous"));
-    }
+    remaining(deadline)?;
+    let target = target.to_ascii_lowercase();
+    let missing = || Error::new("not_found", "Peer is no longer registered");
+    let peer = if valid_id(&target) {
+        match read_live(&root.join(&target), &target) {
+            Ok(peer) => peer.ok_or_else(missing)?,
+            Err(error) if error.code == "not_found" => return Err(missing()),
+            Err(error) => return Err(error),
+        }
+    } else {
+        let mut matches = list(root, deadline)?
+            .into_iter()
+            .filter(|d| d.peer.id.starts_with(&target));
+        let peer = matches.next().ok_or_else(missing)?;
+        if matches.next().is_some() {
+            return Err(Error::new("ambiguous_peer", "Peer ID prefix is ambiguous"));
+        }
+        peer
+    };
     if peer.protocol != VERSION {
         return Err(Error::new("protocol", "Peer uses an incompatible protocol"));
     }
