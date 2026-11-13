@@ -1,0 +1,19 @@
+[package]
+name = "agent-intercom"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Local messaging between independent agent processes"
+
+[[bin]]
+name = "intercom"
+path = "src/main.rs"
+
+[dependencies]
+getrandom = "=0.4.3"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.183"
